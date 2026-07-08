@@ -10,6 +10,7 @@ import pandas as pd
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import StandardScaler
 
 from paths import DATA_PATH, MODEL_PATH, PLOT_DIR
 
@@ -51,7 +52,7 @@ def create_sequences(data, time_steps=3):
     try:
         X, y = [], []
         for i in range(len(data) - time_steps):
-            X.append(data[i : (i + time_steps)])
+            X.append(data[i: (i + time_steps)])
             y.append(data[i + time_steps])
         return np.array(X), np.array(y)
     except Exception as e:
@@ -118,12 +119,12 @@ def evaluate_model(model, X_train, y_train, X_test, y_test):
         return None, None, None, None, None, None
 
 
-def save_model(model, meta=None, filepath=None):
-    """Save the trained model and metadata."""
+def save_model(model, scaler=None, meta=None, filepath=None):
+    """Save the trained model, scaler, and metadata."""
     if filepath is None:
         filepath = MODEL_PATH
     try:
-        model_data = {"model": model, "meta": meta}
+        model_data = {"model": model, "scaler": scaler, "meta": meta}
         with open(filepath, "wb") as f:
             pickle.dump(model_data, f)
         print(f"Model saved successfully to {filepath}")
@@ -217,8 +218,12 @@ def main():
         # Ensure X has shape (n_samples, time_steps)
         print(f"Sequence shape: {X.shape}")
 
-        train_size = max(1, int(len(X) * 0.8))
-        X_train, X_test = X[:train_size], X[train_size:]
+        # Scale features (X) to stabilize training
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        train_size = max(1, int(len(X_scaled) * 0.8))
+        X_train, X_test = X_scaled[:train_size], X_scaled[train_size:]
         y_train, y_test = y[:train_size], y[train_size:]
 
         print(f"Training set size: {len(X_train)}")
@@ -254,14 +259,14 @@ def main():
             train_mae = float(mean_absolute_error(y_train_inv, train_predict)) if len(y_train_inv) > 0 else None
             test_mae = None
 
-        print("Saving model...")
+        print("Saving model and scaler...")
         meta = {
             "train_mae": float(train_mae) if train_mae is not None else None,
             "test_mae": float(test_mae) if test_mae is not None else None,
             "time_steps": int(time_steps),
             "model_type": type(model).__name__,
         }
-        if not save_model(model, meta):
+        if not save_model(model, scaler=scaler, meta=meta):
             print("Failed to save model")
             return False
 
