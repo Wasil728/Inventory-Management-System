@@ -4,7 +4,7 @@ import pickle
 import numpy as np
 import pandas as pd
 from flask import Flask, request, render_template, jsonify
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import MinMaxScaler
 
 from paths import DATA_PATH, DATA_SET_DIR, MODEL_PATH, STATIC_DIR
@@ -31,110 +31,113 @@ def page(template: str, *, nav_active: str = "", **kwargs):
 app.config["UPLOAD_FOLDER"] = DATA_SET_DIR
 app.config["MODEL_PATH"] = MODEL_PATH
 app.config["DATA_PATH"] = DATA_PATH
+# Limit uploads to 5MB
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 
 # Load the pickled model
+# The pickle is expected to be a dict: {"model": ..., "scaler": ..., "meta": {...}}
+model_data = None
+
+
 def load_trained_model():
-    """Load the trained model with proper error handling"""
+    """Load the trained model with proper error handling. Returns dict or None."""
+    global model_data
     try:
-        with open(app.config['MODEL_PATH'], 'rb') as model_file:
-            model_data = pickle.load(model_file)
-        
-        # Check if the loaded data is a model or a dictionary containing a model
-        if hasattr(model_data, 'predict'):
-            print("Model loaded successfully!")
-            return model_data
-        elif isinstance(model_data, dict) and 'model' in model_data:
-            print("Model loaded successfully from dictionary!")
-            return model_data['model']
-        else:
-            print("Loaded data is not a valid model")
+        if not os.path.exists(app.config['MODEL_PATH']):
+            print(f"Model file not found at {app.config['MODEL_PATH']}")
             return None
-    except FileNotFoundError:
-        print(f"Model file not found at {app.config['MODEL_PATH']}")
+
+        with open(app.config['MODEL_PATH'], 'rb') as model_file:
+            md = pickle.load(model_file)
+
+        # md should be a dict containing keys 'model', optionally 'scaler' and 'meta'
+        if isinstance(md, dict) and 'model' in md:
+            model_data = md
+            print("Model data loaded successfully!")
+            return model_data
+
+        # Backwards compatibility: a raw sklearn estimator
+        if hasattr(md, 'predict'):
+            model_data = {'model': md, 'scaler': None, 'meta': {}}
+            print("Loaded raw model (no meta)")
+            return model_data
+
+        print("Loaded data is not a valid model format")
         return None
     except Exception as e:
         print(f"Error loading model: {str(e)}")
         return None
 
+
+# Try to load model on startup
+model_data = load_trained_model()
+
+
 def simple_prediction(quantity1, quantity2, quantity3):
     """Simple prediction using weighted average"""
     try:
-        # Simple weighted average prediction
-        weights = [0.2, 0.3, 0.5]  # Give more weight to recent data
+        weights = [0.2, 0.3, 0.5]
         prediction = (quantity1 * weights[0] + quantity2 * weights[1] + quantity3 * weights[2])
         return prediction
     except Exception as e:
         print(f"Simple prediction error: {str(e)}")
         return None
 
-model = load_trained_model()
 
 @app.route('/')
 def home():
     return page("index.html", nav_active="home")
 
+
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    """Handle file upload with improved error handling"""
+    """Handle file upload with validation before saving"""
     try:
         if 'file' not in request.files:
-            return jsonify({
-                "success": False,
-                "error": "No file part"
-            }), 400
-        
+            return jsonify({"success": False, "error": "No file part"}), 400
+
         file = request.files['file']
         if file.filename == '':
-            return jsonify({
-                "success": False,
-                "error": "No selected file"
-            }), 400
-        
+            return jsonify({"success": False, "error": "No selected file"}), 400
+
         if not file.filename.endswith('.csv'):
-            return jsonify({
-                "success": False,
-                "error": "Please upload a CSV file"
-            }), 400
-        
+            return jsonify({"success": False, "error": "Please upload a CSV file"}), 400
+
+        # Read into pandas to validate columns before saving
+        try:
+            df = pd.read_csv(file)
+        except Exception as e:
+            return jsonify({"success": False, "error": f"Invalid CSV: {str(e)}"}), 400
+
+        from utils import validate_csv_data
+        valid, msg = validate_csv_data(df)
+        if not valid:
+            return jsonify({"success": False, "error": msg}), 400
+
         # Save the file to the data directory
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], 'data.csv')
-        file.save(file_path)
-        
-        return jsonify({
-            "success": True,
-            "message": "File uploaded successfully!"
-        }), 200
-        
+        df.to_csv(file_path, index=False)
+
+        return jsonify({"success": True, "message": "File uploaded and validated successfully!"}), 200
+
     except Exception as e:
         print(f"Upload error: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": f"Error saving file: {str(e)}"
-        }), 500
+        return jsonify({"success": False, "error": f"Error saving file: {str(e)}"}), 500
+
 
 @app.route('/inventory')
 def inventory():
     """Display inventory with restocking and expiry recommendations"""
     try:
-        # Check if data file exists
         if not os.path.exists(app.config['DATA_PATH']):
-            return page(
-                "error.html",
-                nav_active="",
-                error="No data file. Upload a CSV from Home first.",
-            )
+            return page("error.html", nav_active="", error="No data file. Upload a CSV from Home first.")
 
-        # Read data from CSV file
         df = pd.read_csv(app.config['DATA_PATH'])
-        
-        # Get recommendations for restocking and near expiry products
         low_stock_recommendations = get_low_stock_products(df)
         near_expiry_recommendations = get_near_expiry_products(df)
-        
-        # Get inventory metrics
         from utils import calculate_inventory_metrics
         metrics = calculate_inventory_metrics(df)
-        
+
         return page(
             "inventory.html",
             nav_active="inventory",
@@ -145,47 +148,82 @@ def inventory():
     except Exception as e:
         return page("error.html", nav_active="", error=f"Inventory error: {str(e)}")
 
+
 @app.route('/predict', methods=["GET", "POST"])
 def predict():
-    """Handle prediction requests with improved error handling"""
+    """Handle prediction requests using trained model + scaler (if present)"""
+    global model_data
     if request.method == "POST":
         try:
-            # Extract input data from the request
             data = request.get_json()
             if not data:
-                return jsonify({
-                    "success": False,
-                    "error": "No data provided"
-                }), 400
-            
-            quantity1 = float(data.get('quantity1', 0))
-            quantity2 = float(data.get('quantity2', 0))
-            quantity3 = float(data.get('quantity3', 0))
+                return jsonify({"success": False, "error": "No data provided"}), 400
 
-            # Validate input data
-            if quantity1 < 0 or quantity2 < 0 or quantity3 < 0:
-                return jsonify({
-                    "success": False,
-                    "error": "Quantities must be non-negative"
-                }), 400
+            # Determine expected time_steps
+            time_steps = 3
+            model_meta = model_data.get('meta') if model_data else None
+            if model_meta and isinstance(model_meta, dict):
+                time_steps = int(model_meta.get('time_steps', 3))
 
-            # Try to use the trained model first
-            if model is not None and hasattr(model, 'predict'):
+            # Collect quantities quantity1..quantityN
+            quantities = []
+            for i in range(time_steps):
+                key = f'quantity{i+1}'
+                if key not in data:
+                    return jsonify({"success": False, "error": f"Missing field: {key}. Expected {time_steps} quantities."}), 400
+                q = float(data.get(key, 0))
+                if q < 0:
+                    return jsonify({"success": False, "error": "Quantities must be non-negative"}), 400
+                quantities.append(q)
+
+            # If we have a trained model, use it
+            if model_data and 'model' in model_data:
                 try:
-                    # Prepare the input data for prediction
-                    input_data = np.array([[quantity1, quantity2, quantity3]])
-                    prediction_value = model.predict(input_data)[0][0]
-                    return jsonify({
+                    model = model_data['model']
+                    scaler = model_data.get('scaler')
+
+                    X = np.array([quantities])  # shape (1, time_steps)
+                    if scaler is not None:
+                        try:
+                            X_proc = scaler.transform(X)
+                        except Exception:
+                            # scaler might expect a different shape — attempt reshape
+                            X_proc = scaler.transform(np.asarray(X).reshape(1, -1))
+                    else:
+                        X_proc = X
+
+                    pred = model.predict(X_proc)
+                    # model.predict may return scalar-like arrays
+                    if hasattr(pred, '__iter__'):
+                        prediction_value = float(np.ravel(pred)[0])
+                    else:
+                        prediction_value = float(pred)
+
+                    resp = {
                         "success": True,
-                        "prediction": float(prediction_value)
-                    })
+                        "prediction": prediction_value,
+                        "method": "model",
+                        "model_type": model_data.get('meta', {}).get('model_type') if model_data.get('meta') else None,
+                        "train_mae": model_data.get('meta', {}).get('train_mae') if model_data.get('meta') else None,
+                        "test_mae": model_data.get('meta', {}).get('test_mae') if model_data.get('meta') else None,
+                        "time_steps": model_data.get('meta', {}).get('time_steps') if model_data.get('meta') else time_steps,
+                    }
+                    return jsonify(resp)
                 except Exception as model_error:
                     print(f"Model prediction failed: {str(model_error)}")
                     # Fall back to simple prediction
                     pass
 
-            # Fallback to simple prediction
-            prediction_value = simple_prediction(quantity1, quantity2, quantity3)
+            # Fallback
+            if len(quantities) >= 3:
+                prediction_value = simple_prediction(quantities[-3], quantities[-2], quantities[-1])
+            else:
+                # If fewer than 3, pad with zeros
+                padded = [0, 0, 0]
+                for i in range(len(quantities)):
+                    padded[-len(quantities) + i] = quantities[i]
+                prediction_value = simple_prediction(padded[-3], padded[-2], padded[-1])
+
             if prediction_value is not None:
                 return jsonify({
                     "success": True,
@@ -193,55 +231,31 @@ def predict():
                     "method": "simple_weighted_average"
                 })
             else:
-                return jsonify({
-                    "success": False,
-                    "error": "Failed to make prediction"
-                }), 500
+                return jsonify({"success": False, "error": "Failed to make prediction"}), 500
 
         except ValueError as e:
-            return jsonify({
-                "success": False,
-                "error": f"Invalid input data: {str(e)}"
-            }), 400
+            return jsonify({"success": False, "error": f"Invalid input data: {str(e)}"}), 400
         except Exception as e:
             print(f"Prediction error: {str(e)}")
-            return jsonify({
-                "success": False,
-                "error": f"Failed to make prediction: {str(e)}"
-            }), 500
+            return jsonify({"success": False, "error": f"Failed to make prediction: {str(e)}"}), 500
 
     elif request.method == "GET":
-        return page(
-            "prediction.html",
-            nav_active="predict",
-            model_loaded=model is not None,
-        )
+        return page("prediction.html", nav_active="predict", model_loaded=bool(model_data))
+
 
 @app.route('/analytics')
 def sales_analytics():
     """Display sales analytics with improved error handling"""
     try:
-        # Check if data file exists
         if not os.path.exists(app.config['DATA_PATH']):
-            return page(
-                "error.html",
-                nav_active="",
-                error="No data file. Upload a CSV from Home first.",
-            )
+            return page("error.html", nav_active="", error="No data file. Upload a CSV from Home first.")
 
-        # Load data from CSV file
         data = pd.read_csv(app.config['DATA_PATH'])
-        
-        # Calculate total sales and average order value
         total_sales = float(data["total_revenue"].sum())
         average_order_value = float(data["total_revenue"].mean())
-
-        # Find top 5 selling and bottom 5 selling products based on quantity_stock
-        # Since we don't have quantity_sold, we'll use quantity_stock as a proxy
         top_selling_products = data.nlargest(5, "quantity_stock")
         bottom_selling_products = data.nsmallest(5, "quantity_stock")
 
-        # Convert DataFrames to dictionaries and ensure JSON serializable
         top_selling_dict = []
         for _, row in top_selling_products.iterrows():
             top_selling_dict.append({
@@ -279,46 +293,35 @@ def sales_analytics():
         print(f"Analytics error: {str(e)}")
         return page("error.html", nav_active="", error=f"Analytics error: {str(e)}")
 
+
 @app.route('/train', methods=['POST'])
-def train_model():
+def train_model_route():
     """Train the prediction model"""
     try:
         from Prediction import main as train_prediction_model
         print("Starting model training process...")
         success = train_prediction_model()
-        
+
         if success:
-            # Reload the model
-            global model
-            model = load_trained_model()
-            if model is not None:
-                return jsonify({
-                    "success": True,
-                    "message": "Model trained successfully!"
-                }), 200
+            global model_data
+            model_data = load_trained_model()
+            if model_data is not None:
+                return jsonify({"success": True, "message": "Model trained successfully!"}), 200
             else:
-                return jsonify({
-                    "success": False,
-                    "error": "Model training completed but failed to load the model."
-                }), 500
+                return jsonify({"success": False, "error": "Model training completed but failed to load the model."}), 500
         else:
-            return jsonify({
-                "success": False,
-                "error": "Model training failed. Check the logs for details."
-            }), 500
+            return jsonify({"success": False, "error": "Model training failed. Check the logs for details."}), 500
     except Exception as e:
         print(f"Training error: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": f"Error training model: {str(e)}"
-        }), 500
+        return jsonify({"success": False, "error": f"Error training model: {str(e)}"}), 500
+
 
 @app.route('/api/inventory-summary')
 def inventory_summary():
     """API endpoint for inventory summary"""
     try:
         print(f"Checking for data file at: {app.config['DATA_PATH']}")
-        
+
         if not os.path.exists(app.config['DATA_PATH']):
             print("Data file not found, returning default metrics")
             return jsonify({
@@ -333,10 +336,10 @@ def inventory_summary():
                 },
                 "message": "No data file found. Please upload a CSV file first."
             }), 200
-        
+
         print("Data file found, generating report...")
         report = generate_inventory_report(app.config['DATA_PATH'])
-        
+
         if report:
             print(f"Report generated successfully: {report}")
             return jsonify(report)
@@ -368,6 +371,7 @@ def inventory_summary():
             },
             "error": str(e)
         }), 200
+
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
