@@ -36,12 +36,27 @@
                 <input type="number" id="quantity3" name="quantity3" required min="0" step="0.01">
             </div>
         </div>
-        <button type="submit" class="btn btn-primary">Run</button>
+        <div class="form-actions">
+            <button type="submit" class="btn btn-primary" id="runPredictBtn">Run</button>
+            <span id="predictSpinner" class="muted" style="display:none">Running…</span>
+        </div>
     </form>
 
     <div id="predictionResult" class="prediction-result" hidden>
         <h3>Result</h3>
         <p class="prediction-result__line" id="predictionValue"></p>
+        <ul class="prediction-meta" id="predictionMeta">
+            <li><strong>Method:</strong> <span id="metaMethod"></span></li>
+            <li><strong>Model:</strong> <span id="metaModel"></span></li>
+            <li><strong>Train MAE:</strong> <span id="metaTrainMAE"></span></li>
+            <li><strong>Test MAE:</strong> <span id="metaTestMAE"></span></li>
+            <li><strong>Time steps:</strong> <span id="metaTimeSteps"></span></li>
+        </ul>
+        <p id="predictionAdvice" class="muted"></p>
     </div>
+
+    <div id="predictionError" class="error-message" hidden aria-live="polite"></div>
 </section>
+
+<script src="/static/js/predict.js"></script>
 {% endblock %}
