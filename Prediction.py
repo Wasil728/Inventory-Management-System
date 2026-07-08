@@ -27,10 +27,14 @@ def load_and_preprocess_data():
         if "quantity_stock" not in df.columns:
             raise ValueError("Required column 'quantity_stock' not found in data")
 
-        df = df.sort_values("product_id")
+        # If there's a timestamp, sort by it per product; otherwise fallback to product_id
+        if "timestamp" in df.columns:
+            df = df.sort_values(["product_id", "timestamp"])  # expects timestamp to be parseable
+        else:
+            df = df.sort_values("product_id")
 
         # Raw stock levels — matches quantity1/2/3 passed to model.predict() in app.py
-        data = df["quantity_stock"].values.reshape(-1, 1).astype(np.float64)
+        data = df["quantity_stock"].values.astype(np.float64)
 
         print(f"Preprocessed data shape: {data.shape}")
         return data, df
@@ -40,12 +44,15 @@ def load_and_preprocess_data():
 
 
 def create_sequences(data, time_steps=3):
-    """Sliding-window features and targets."""
+    """Sliding-window features and targets.
+
+    Returns X with shape (n_samples, time_steps) and y with shape (n_samples,)
+    """
     try:
         X, y = [], []
         for i in range(len(data) - time_steps):
-            X.append(data[i : (i + time_steps), 0])
-            y.append(data[i + time_steps, 0])
+            X.append(data[i : (i + time_steps)])
+            y.append(data[i + time_steps])
         return np.array(X), np.array(y)
     except Exception as e:
         print(f"Error creating sequences: {str(e)}")
@@ -80,42 +87,43 @@ def train_model(model, X_train, y_train):
 
 
 def evaluate_model(model, X_train, y_train, X_test, y_test):
-    """Metrics in raw quantity units."""
+    """Metrics in raw quantity units. Returns predictions and MAE metrics."""
     try:
         train_predict = model.predict(X_train)
-        train_predict = np.asarray(train_predict).reshape(-1, 1)
-        y_train_2d = np.asarray(y_train).reshape(-1, 1)
+        train_predict = np.asarray(train_predict).reshape(-1)
+        y_train_1d = np.asarray(y_train).reshape(-1)
 
-        train_rmse = np.sqrt(mean_squared_error(y_train_2d, train_predict))
-        train_mae = mean_absolute_error(y_train_2d, train_predict)
+        train_rmse = np.sqrt(mean_squared_error(y_train_1d, train_predict))
+        train_mae = mean_absolute_error(y_train_1d, train_predict)
         print(f"Training RMSE: {train_rmse:.2f}")
         print(f"Training MAE: {train_mae:.2f}")
 
         if len(X_test) > 0 and len(y_test) > 0:
             test_predict = model.predict(X_test)
-            test_predict = np.asarray(test_predict).reshape(-1, 1)
-            y_test_2d = np.asarray(y_test).reshape(-1, 1)
+            test_predict = np.asarray(test_predict).reshape(-1)
+            y_test_1d = np.asarray(y_test).reshape(-1)
 
-            test_rmse = np.sqrt(mean_squared_error(y_test_2d, test_predict))
-            test_mae = mean_absolute_error(y_test_2d, test_predict)
+            test_rmse = np.sqrt(mean_squared_error(y_test_1d, test_predict))
+            test_mae = mean_absolute_error(y_test_1d, test_predict)
             print(f"Test RMSE: {test_rmse:.2f}")
             print(f"Test MAE: {test_mae:.2f}")
         else:
             test_predict = None
-            y_test_2d = None
+            y_test_1d = None
+            test_mae = None
 
-        return train_predict, test_predict, y_train_2d, y_test_2d
+        return train_predict, test_predict, y_train_1d, y_test_1d, train_mae, test_mae
     except Exception as e:
         print(f"Error evaluating model: {str(e)}")
-        return None, None, None, None
+        return None, None, None, None, None, None
 
 
-def save_model(model, scaler, filepath=None):
-    """Save the trained model; scaler kept for pickle compatibility (may be None)."""
+def save_model(model, meta=None, filepath=None):
+    """Save the trained model and metadata."""
     if filepath is None:
         filepath = MODEL_PATH
     try:
-        model_data = {"model": model, "scaler": scaler}
+        model_data = {"model": model, "meta": meta}
         with open(filepath, "wb") as f:
             pickle.dump(model_data, f)
         print(f"Model saved successfully to {filepath}")
@@ -206,6 +214,9 @@ def main():
             print(f"Not enough sequences for training. Need at least 3, got {len(X)}")
             return False
 
+        # Ensure X has shape (n_samples, time_steps)
+        print(f"Sequence shape: {X.shape}")
+
         train_size = max(1, int(len(X) * 0.8))
         X_train, X_test = X[:train_size], X[train_size:]
         y_train, y_test = y[:train_size], y[train_size:]
@@ -227,7 +238,7 @@ def main():
 
         if len(X_test) > 0:
             print("Evaluating model...")
-            train_predict, test_predict, y_train_inv, y_test_inv = evaluate_model(
+            train_predict, test_predict, y_train_inv, y_test_inv, train_mae, test_mae = evaluate_model(
                 model, X_train, y_train, X_test, y_test
             )
             if train_predict is None:
@@ -236,13 +247,21 @@ def main():
         else:
             print("Making predictions on training data...")
             train_predict = model.predict(X_train)
-            train_predict = np.asarray(train_predict).reshape(-1, 1)
-            y_train_inv = np.asarray(y_train).reshape(-1, 1)
+            train_predict = np.asarray(train_predict).reshape(-1)
+            y_train_inv = np.asarray(y_train).reshape(-1)
             test_predict = None
             y_test_inv = None
+            train_mae = float(mean_absolute_error(y_train_inv, train_predict)) if len(y_train_inv) > 0 else None
+            test_mae = None
 
         print("Saving model...")
-        if not save_model(model, None):
+        meta = {
+            "train_mae": float(train_mae) if train_mae is not None else None,
+            "test_mae": float(test_mae) if test_mae is not None else None,
+            "time_steps": int(time_steps),
+            "model_type": type(model).__name__,
+        }
+        if not save_model(model, meta):
             print("Failed to save model")
             return False
 
